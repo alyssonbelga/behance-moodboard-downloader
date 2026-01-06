@@ -22,7 +22,55 @@ PROJECT_MODULES_PRIORITY = {
     "project_modules_max": 3,
     "project_modules": 2,
 }
+# Mantém apenas o que costuma ser conteúdo inserido no editor do projeto (módulos)
+ALLOWED_PATH_KEYWORDS = (
+    "/project_modules",
+    "/project_modules_max",
+)
 
+# Coisas que NÃO são conteúdo do projeto (avatars, assets, ícones, etc.)
+BLOCKED_PATH_KEYWORDS = (
+    "/users/",
+    "/user/",
+    "/avatars/",
+    "/avatar/",
+    "/assets/",
+    "/icons/",
+    "/icon/",
+    "/static/",
+    "/badges/",
+    "/favicon",
+    "/fonts/",
+)
+
+def is_behance_project_image(url: str) -> bool:
+    """True somente para imagens do conteúdo do projeto (módulos)."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = (parsed.path or "").lower()
+
+        if host not in CDN_DOMAINS:
+            return False
+
+        if any(b in path for b in BLOCKED_PATH_KEYWORDS):
+            return False
+
+        # Regra principal: só módulos do projeto
+        return any(k in path for k in ALLOWED_PATH_KEYWORDS)
+    except Exception:
+        return False
+
+def canonical_key(url: str) -> str:
+    """
+    Deduplica a "mesma imagem" em tamanhos diferentes.
+    Ex: project_modules_max_3840 -> project_modules_max
+    Remove query/fragment.
+    """
+    parsed = urlparse(url)
+    clean = parsed._replace(query="", fragment="").geturl()
+    clean = re.sub(r"(project_modules_max)_\d+", r"\1", clean, flags=re.IGNORECASE)
+    return clean
 
 @dataclass
 class ImageCandidate:
@@ -71,12 +119,12 @@ def extract_urls_from_css(css_text: str) -> List[str]:
 
 
 def extract_behance_cdn_urls(html: str) -> List[str]:
+    # Pega apenas URLs do CDN que tenham project_modules (conteúdo do projeto)
     pattern = re.compile(
-        r"https?://(?:mir-s3-cdn-cf\.behance\.net/[^\"'\s)]+)",
+        r"https?://mir-s3-cdn-cf\.behance\.net/(?:project_modules(?:_max_[0-9]+)?)/[^\"'\s)]+",
         re.IGNORECASE,
     )
     return pattern.findall(html)
-
 
 def resolve_url(base_url: str, candidate: str) -> Optional[str]:
     if not candidate:
@@ -143,29 +191,53 @@ def collect_image_candidates(base_url: str, html: str) -> List[ImageCandidate]:
             candidates.append(
                 ImageCandidate(cdn_url, resolved, candidate_priority(resolved))
             )
-
+    # FILTRO FINAL: só conteúdo do projeto
+    candidates = [c for c in candidates if is_behance_project_image(c.resolved_url)]
     return candidates
 
 
 def dedupe_candidates(candidates: Iterable[ImageCandidate]) -> List[ImageCandidate]:
     best: Dict[str, ImageCandidate] = {}
-    for candidate in candidates:
-        parsed = urlparse(candidate.resolved_url)
-        key = parsed._replace(query="", fragment="").geturl()
-        existing = best.get(key)
-        if existing is None or candidate.priority > existing.priority:
-            best[key] = candidate
-    return list(best.values())
 
+    def score(u: str) -> int:
+        u = u.lower()
+        # Prioriza project_modules_max (melhor qualidade)
+        if "project_modules_max" in u:
+            return 3
+        if "/project_modules/" in u:
+            return 2
+        return 1
+
+    for candidate in candidates:
+        key = canonical_key(candidate.resolved_url)
+        existing = best.get(key)
+        if existing is None:
+            best[key] = candidate
+        else:
+            # Mantém o de maior qualidade (max > normal)
+            if score(candidate.resolved_url) > score(existing.resolved_url):
+                best[key] = candidate
+
+    # Ordena para baixar max primeiro
+    return sorted(best.values(), key=lambda c: -score(c.resolved_url))
 
 def render_with_playwright(url: str, timeout: int = 20000) -> str:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page()
         page.goto(url, wait_until="networkidle", timeout=timeout)
-        content = page.content()
+
+        # Tenta pegar apenas a área principal do projeto
+        try:
+            page.wait_for_selector("main", timeout=timeout)
+            content = page.locator("main").inner_html()
+        except Exception:
+            # fallback: página inteira
+            content = page.content()
+
         browser.close()
         return content
+
 
 
 def download_image(
