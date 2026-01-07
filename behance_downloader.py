@@ -17,6 +17,28 @@ CDN_DOMAINS = {
     "mir-s3-cdn-cf.behance.net",
     "mir-s3-cdn-cf.behance.net",
 }
+ALLOWED_DOMAINS = {"mir-s3-cdn-cf.behance.net"}
+
+def is_project_asset(url: str) -> bool:
+    p = urlparse(url)
+    if p.netloc not in ALLOWED_DOMAINS:
+        return False
+
+    path = (p.path or "").lower()
+
+    # Só o que o autor colocou nos módulos do projeto:
+    # - imagens grandes webp: fs_webp
+    # - gifs/arquivos “originais”: source (importante porque alguns gifs não têm fs_webp)
+    if "/project_modules/" not in path:
+        return False
+
+    if "/project_modules/fs_webp/" in path:
+        return True
+
+    if "/project_modules/source/" in path and (path.endswith(".gif") or path.endswith(".mp4")):
+        return True
+
+    return False
 
 PROJECT_MODULES_PRIORITY = {
     "project_modules_max": 3,
@@ -103,10 +125,15 @@ def fetch_html(session: requests.Session, url: str, timeout: int = 20) -> str:
 def extract_urls_from_srcset(srcset: str) -> List[str]:
     urls = []
     for part in srcset.split(","):
-        url = part.strip().split(" ")[0]
+        token = part.strip()
+        if not token:
+            continue
+        # pega só a primeira “palavra” (remove "2x", "100w", etc.)
+        url = token.split()[0].strip().strip(",")
         if url:
             urls.append(url)
     return urls
+
 
 
 def extract_urls_from_css(css_text: str) -> List[str]:
@@ -256,29 +283,26 @@ def collect_image_candidates(base_url: str, html: str) -> List[ImageCandidate]:
             candidates.append(
                 ImageCandidate(cdn_url, resolved, candidate_priority(resolved))
             )
-    # FILTRO FINAL: só conteúdo do projeto
-    candidates = [c for c in candidates if is_behance_project_image(c.resolved_url)]
+    # FILTRO FINAL: só assets do corpo do projeto
+    candidates = [c for c in candidates if is_project_asset(c.resolved_url)]
     return candidates
-
 
 def dedupe_candidates(candidates: Iterable[ImageCandidate]) -> List[ImageCandidate]:
     best: Dict[str, ImageCandidate] = {}
 
-    def score(u: str) -> int:
-        ul = u.lower()
-        if "project_modules_max" in ul:
-            return 3
-        if "/project_modules/" in ul:
-            return 2
-        return 1
+    def key(url: str) -> str:
+        p = urlparse(url)
+        # remove query/fragment e remove o “tamanho” do caminho (fs_webp, 1400_webp etc.)
+        path = re.sub(r"/project_modules/[^/]+/", "/project_modules/__SIZE__/", p.path, flags=re.IGNORECASE)
+        return p._replace(path=path, query="", fragment="").geturl()
 
     for c in candidates:
-        key = canonical_key_stronger(c.resolved_url)
-        existing = best.get(key)
-        if existing is None or score(c.resolved_url) > score(existing.resolved_url):
-            best[key] = c
+        k = key(c.resolved_url)
+        # como já filtramos, qualquer um serve; mas mantemos o primeiro
+        if k not in best:
+            best[k] = c
 
-    return sorted(best.values(), key=lambda c: -score(c.resolved_url))
+    return list(best.values())
 
 def render_with_playwright(url: str, timeout: int = 20000) -> str:
     with sync_playwright() as playwright:
