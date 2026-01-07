@@ -125,6 +125,71 @@ def extract_behance_cdn_urls(html: str) -> List[str]:
         re.IGNORECASE,
     )
     return pattern.findall(html)
+def extract_next_data_json(html: str) -> Optional[dict]:
+    """
+    Behance (Next.js) embute um JSON enorme em <script id="__NEXT_DATA__" type="application/json">.
+    Esse JSON contém os módulos reais do projeto (o que o autor colocou no editor).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__", type="application/json")
+    if not tag or not tag.string:
+        return None
+    try:
+        return json.loads(tag.string)
+    except Exception:
+        return None
+
+
+def walk_for_urls(obj, out: Set[str]) -> None:
+    """
+    Percorre recursivamente dict/list/str e captura URLs do CDN.
+    """
+    if obj is None:
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            walk_for_urls(v, out)
+    elif isinstance(obj, list):
+        for it in obj:
+            walk_for_urls(it, out)
+    elif isinstance(obj, str):
+        # Captura só URLs do CDN do Behance
+        if obj.startswith("http"):
+            parsed = urlparse(obj)
+            if parsed.netloc in CDN_DOMAINS:
+                out.add(obj)
+
+
+def is_project_module_url(url: str) -> bool:
+    """
+    Mantém somente URLs típicas do conteúdo do projeto.
+    (isso remove avatar, comentários, suggested, UI)
+    """
+    path = (urlparse(url).path or "").lower()
+    return (
+        "/project_modules" in path
+        or "project_modules_max" in path
+        or "/projects/" in path  # opcional: capa
+    )
+
+
+def canonical_key_stronger(url: str) -> str:
+    """
+    Deduplica melhor:
+    - remove query/fragment
+    - normaliza project_modules_max_XXXX -> project_modules_max
+    - remove extensão (.jpg/.png/.webp) para juntar a mesma imagem em formatos diferentes
+    """
+    parsed = urlparse(url)
+    path = parsed.path
+    path = re.sub(r"(project_modules_max)_\d+", r"\1", path, flags=re.IGNORECASE)
+
+    # remove extensão pra juntar jpg/webp/png iguais (mesmo stem)
+    root, _ext = os.path.splitext(path)
+    path_no_ext = root
+
+    clean = parsed._replace(path=path_no_ext, query="", fragment="").geturl()
+    return clean
 
 def resolve_url(base_url: str, candidate: str) -> Optional[str]:
     if not candidate:
@@ -200,25 +265,19 @@ def dedupe_candidates(candidates: Iterable[ImageCandidate]) -> List[ImageCandida
     best: Dict[str, ImageCandidate] = {}
 
     def score(u: str) -> int:
-        u = u.lower()
-        # Prioriza project_modules_max (melhor qualidade)
-        if "project_modules_max" in u:
+        ul = u.lower()
+        if "project_modules_max" in ul:
             return 3
-        if "/project_modules/" in u:
+        if "/project_modules/" in ul:
             return 2
         return 1
 
-    for candidate in candidates:
-        key = canonical_key(candidate.resolved_url)
+    for c in candidates:
+        key = canonical_key_stronger(c.resolved_url)
         existing = best.get(key)
-        if existing is None:
-            best[key] = candidate
-        else:
-            # Mantém o de maior qualidade (max > normal)
-            if score(candidate.resolved_url) > score(existing.resolved_url):
-                best[key] = candidate
+        if existing is None or score(c.resolved_url) > score(existing.resolved_url):
+            best[key] = c
 
-    # Ordena para baixar max primeiro
     return sorted(best.values(), key=lambda c: -score(c.resolved_url))
 
 def render_with_playwright(url: str, timeout: int = 20000) -> str:
@@ -308,7 +367,22 @@ def main() -> int:
         print(f"Erro ao baixar HTML via requests: {exc}")
         return 1
 
-    candidates = collect_image_candidates(url, html)
+        # 1) Tenta extrair do __NEXT_DATA__ (mais limpo e “só projeto”)
+    next_data = extract_next_data_json(html)
+    next_urls: Set[str] = set()
+    if next_data:
+        walk_for_urls(next_data, next_urls)
+    
+    # filtra só módulos do projeto
+    next_urls = {u for u in next_urls if is_project_module_url(u)}
+    
+    candidates: List[ImageCandidate] = []
+    for u in next_urls:
+        candidates.append(ImageCandidate(u, u, candidate_priority(u)))
+    
+    # 2) Se vier pouco, cai pro método antigo (HTML/Playwright)
+    if len(candidates) < args.min_images:
+        candidates = collect_image_candidates(url, html)
 
     if len(candidates) < args.min_images:
         try:
